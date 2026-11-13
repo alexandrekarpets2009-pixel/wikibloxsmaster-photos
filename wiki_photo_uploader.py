@@ -163,6 +163,141 @@ def delete_entry(cfg, store, entry_id):
             raise
 
 
+# ---------------------------------------------------------------- safety
+# Roblox moderation is secret, so nothing can guarantee an image passes. These checks keep the risk
+# very low and FAIL CLOSED: when something can't be verified, the photo is not uploaded.
+#
+# 1. Only "safe" subjects get photos (decided by the game from Wikidata, sent as job["k"]).
+SAFE_SUBJECTS = {
+    "settlement", "place", "water", "mountain", "island", "church", "school", "station", "airport",
+    "stadium", "bridge", "castle", "museum", "road", "building", "species", "ship", "vehicle", "space",
+}
+# 2. Words that block an image when found in its file name, Wikimedia categories or description.
+BLOCK_WORDS = [
+    # nudity / sexual
+    "nude", "nudity", "naked", "topless", "bare breast", "breast", "nipple", "genital", "penis", "vagina", "vulva", "buttock",
+    " sex", "sexual", "sexy", "erotic", "porn", "lingerie", "underwear", "bikini", "swimsuit", "striptease", "prostitut",
+    "fetish", "bdsm", " nu ", " nue ", " nus ", " nues ", "nudité", "érotique", "desnud", "nackt", "akt (", " nudo", "naakt",
+    "голы", "обнаж", "ヌード", "裸",
+    # art that often shows nudity (statues, sculptures, paintings)
+    "statue", "sculpt", "venus", "aphrodite", "painting", "fresco", "artwork", "bather", " bath ", "classical antiquity",
+    "skulptur", "statua", "estatua", "beeld", "peinture", "gemälde", "pintura", "dipinto",
+    # death / gore / medical
+    "corpse", "dead body", "dead bodies", "cadaver", "skeleton", "skull", "death", "killed", "murder", "execution", "hanged",
+    "hanging", "lynch", "beheading", " gore", "blood", "wound", "injur", "surgery", "autopsy", "medical", "disease", "tumor",
+    "tumour", "lesion", "symptom", "infection", "pathology", "anatomy", "dissection", "mummy", "mummies", " grave", "cemetery",
+    "cadavre", " mort ", "leiche", "cadáver", "cadavere", "труп",
+    # violence / war / weapons / crime
+    " war ", " wars ", "warfare", "battle", "massacre", "genocide", "holocaust", "concentration camp", "atrocit", "terror",
+    " bomb ", "bombing", "bomber", "explosion", "weapon", "firearm", "rifle", "pistol", "handgun", " gun ", " guns",
+    "ammunition", "grenade", "missile", "military", "soldier", " army", "torture", "prison", " riot", "crime", "police brutality",
+    # extremism / hate symbols
+    "nazi", "swastika", "hakenkreuz", "hitler", "third reich", " ss ", "waffen", "fascis", "ku klux", "kkk", "isis",
+    "confederate flag", "extremis", "propaganda",
+    # drugs / alcohol / gambling
+    "drug", "cannabis", "marijuana", "cocaine", "heroin", "opium", "narcotic", "alcohol", "beer", "wine", "vodka",
+    "whisky", "liquor", "cigarette", "tobacco", "smoking", "casino", "gambling",
+]
+# 3. NudeNet (free nudity detector) classes that block an image.
+BLOCK_NUDENET = {
+    "FEMALE_BREAST_EXPOSED", "FEMALE_GENITALIA_EXPOSED", "MALE_GENITALIA_EXPOSED", "BUTTOCKS_EXPOSED", "ANUS_EXPOSED",
+    "FEMALE_BREAST_COVERED", "FEMALE_GENITALIA_COVERED", "BUTTOCKS_COVERED", "MALE_BREAST_EXPOSED", "BELLY_EXPOSED",
+}
+NUDENET_MIN_SCORE = 0.30
+
+
+class SafetyUnavailable(Exception):
+    """A check couldn't run (network, missing detector): keep the job and try again later."""
+
+
+def wikimedia_file(url):
+    """'https://upload.wikimedia.org/wikipedia/commons/thumb/f/f4/X.jpg/500px-X.jpg' -> ('commons.wikimedia.org', 'X.jpg')"""
+    path = urllib.parse.urlparse(url).path
+    parts = path.split("/wikipedia/", 1)
+    if len(parts) != 2:
+        return None, None
+    segs = parts[1].split("/")
+    project = segs[0]
+    if len(segs) > 1 and segs[1] == "thumb":
+        name = segs[4] if len(segs) > 4 else None
+    else:
+        name = segs[3] if len(segs) > 3 else None
+    if not name:
+        return None, None
+    host = "commons.wikimedia.org" if project == "commons" else f"{project}.wikipedia.org"
+    return host, urllib.parse.unquote(name)
+
+
+def blocked_word(text):
+    low = " " + text.lower().replace("_", " ") + " "
+    for w in BLOCK_WORDS:
+        if w in low:
+            return w.strip()
+    return None
+
+
+def safety_precheck(job):
+    """Returns a reason string when the photo must NOT be uploaded, None when it's fine."""
+    subject = job.get("k")
+    if subject not in SAFE_SUBJECTS:
+        return f"subject '{subject}' not in the safe list"
+    reason = blocked_word(f"{job.get('t', '')}")
+    if reason:
+        return f"title contains '{reason}'"
+    host, name = wikimedia_file(job.get("u", ""))
+    if not host:
+        return "unknown image source"
+    api = (f"https://{host}/w/api.php?action=query&format=json&formatversion=2&prop=categories%7Cimageinfo"
+           f"&cllimit=max&iiprop=extmetadata&iiextmetadatafilter=ImageDescription%7CCategories%7CObjectName"
+           f"&titles={urllib.parse.quote('File:' + name)}")
+    try:
+        _, _, raw = request("GET", api, {"User-Agent": WIKI_USER_AGENT}, timeout=30)
+        data = json.loads(raw)
+    except Exception as e:  # noqa: BLE001
+        raise SafetyUnavailable(f"Wikimedia check failed: {e}") from None
+    pages = (data.get("query") or {}).get("pages") or []
+    if not pages:
+        return "image not found on Wikimedia"
+    page = pages[0]
+    texts = [name]
+    for c in page.get("categories") or []:
+        texts.append(c.get("title", ""))
+    for info in page.get("imageinfo") or []:
+        for v in (info.get("extmetadata") or {}).values():
+            if isinstance(v, dict) and isinstance(v.get("value"), str):
+                texts.append(v["value"])
+    reason = blocked_word(" | ".join(texts))
+    if reason:
+        return f"image description/categories contain '{reason}'"
+    return None
+
+
+_detector = None
+
+
+def nudity_check(data):
+    """Runs NudeNet on the image. Returns a reason when it must not be uploaded."""
+    global _detector
+    try:
+        if _detector is None:
+            from nudenet import NudeDetector  # installed by the GitHub workflow (pip install nudenet)
+            _detector = NudeDetector()
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as f:
+            f.write(data)
+            path = f.name
+        try:
+            found = _detector.detect(path)
+        finally:
+            os.remove(path)
+    except Exception as e:  # noqa: BLE001
+        raise SafetyUnavailable(f"nudity detector unavailable: {e}") from None
+    for d in found or []:
+        if d.get("class") in BLOCK_NUDENET and float(d.get("score", 0)) >= NUDENET_MIN_SCORE:
+            return f"nudity detector found {d.get('class')} ({float(d.get('score', 0)):.2f})"
+    return None
+
+
 # ---------------------------------------------------------------- images
 def download_photo(url):
     status, headers, data = request("GET", url, {"User-Agent": WIKI_USER_AGENT}, timeout=60)
@@ -234,6 +369,19 @@ class Uploader:
             return "already done"
 
         title, lang = job.get("t", entry_id), job.get("l", "en")
+
+        def skip_unsafe(reason):
+            set_entry(self.cfg, IMAGES_STORE, entry_id, {"x": "unsafe"})
+            delete_entry(self.cfg, QUEUE_STORE, entry_id)
+            return f"SKIPPED for safety: {reason}"
+
+        try:
+            reason = safety_precheck(job)
+        except SafetyUnavailable as e:
+            return f"left in queue ({e})"
+        if reason:
+            return skip_unsafe(reason)
+
         try:
             ctype, data = download_photo(job["u"])
         except Exception as e:  # noqa: BLE001 - keep the queue moving
@@ -244,6 +392,13 @@ class Uploader:
             set_entry(self.cfg, IMAGES_STORE, entry_id, {"x": "format"})
             delete_entry(self.cfg, QUEUE_STORE, entry_id)
             return f"skipped (format {ctype})"
+
+        try:
+            reason = nudity_check(data)
+        except SafetyUnavailable as e:
+            return f"left in queue ({e})"
+        if reason:
+            return skip_unsafe(reason)
 
         try:
             asset_id, state = upload_photo(self.cfg, title, lang, ctype, data, self.asset_type)
