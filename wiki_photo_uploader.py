@@ -274,6 +274,11 @@ def main():
     once = "--once" in sys.argv
     pause = float(cfg.get("seconds_between_uploads", 3))
     uploader = Uploader(cfg)
+    # --once (GitHub Actions): keep going until the queue is empty, but stop after ~7.5 minutes
+    # so the run finishes inside its 9-minute limit; the next run continues where this one stopped.
+    started = time.time()
+    budget = float(cfg.get("once_time_budget_seconds", 450))
+    retried = set()
     print(f"Watching the photo queue for universe {cfg['universe_id']} (Ctrl+C to stop)...")
     while True:
         try:
@@ -283,7 +288,14 @@ def main():
             if e.status in (401, 403):
                 sys.exit("Check the API key's permissions (see README.md).")
             ids = []
+        if once:
+            # don't spin on entries that already failed during this run
+            ids = [i for i in ids if i not in retried]
         for entry_id in ids:
+            if once and time.time() - started > budget:
+                print("Time budget reached, the next run will continue.")
+                return
+            retried.add(entry_id)
             try:
                 result = uploader.process(entry_id)
             except HttpError as e:
@@ -295,7 +307,10 @@ def main():
             print(f"{entry_id}: {result}")
             time.sleep(pause)
         if once:
-            break
+            if not ids:
+                print("Queue empty, done.")
+                break
+            continue
         if not ids:
             time.sleep(20)
 
